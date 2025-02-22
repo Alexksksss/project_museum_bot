@@ -56,48 +56,72 @@ async def get_museums():
 @dp.message(lambda message: not message.text.startswith('/'))
 async def handle_text(message: types.Message):
     async with db_pool.acquire() as conn:
-        museums = await get_museums()  # Получаем список музеев
+        museums = await get_museums()
 
-        # Проверяем, является ли введённый текст названием музея
-        if message.text not in museums:  # Это не музей, значит, это ответ на вопрос
-            await handle_answer(message)
+        # Если текст является названием музея, обновляем текущий музей у пользователя
+        if message.text in museums:
+            museum = await conn.fetchrow(
+                "SELECT id FROM museums WHERE name=$1",
+                message.text
+            )
+
+            await conn.execute(
+                "UPDATE users SET current_museum=$1, current_task_id=0 WHERE id=$2",
+                museum['id'], message.from_user.id
+            )
+
+            await message.answer(
+                f"Вы выбрали музей: {message.text}\n"
+                "Теперь можете получить задания командой /tasks."
+            )
             return
 
-        # Если музей есть в списке, получаем его ID
-        museum = await conn.fetchrow(
-            "SELECT id FROM museums WHERE name=$1",
-            message.text
+        # Проверяем, выбрал ли пользователь музей
+        current_museum = await conn.fetchval(
+            "SELECT current_museum FROM users WHERE id=$1",
+            message.from_user.id
         )
 
-        await conn.execute(
-            "UPDATE users SET current_museum=$1 WHERE id=$2",
-            museum['id'], message.from_user.id
-        )
-        await message.answer(
-            f"Вы выбрали музей: {message.text}\n"
-            "Теперь можете получить задания командой /tasks"
-        )
+        if current_museum is None:
+            await message.answer("Сначала выберите музей.")
+            return
+
+        # Если музей выбран, обрабатываем как ответ
+        await handle_answer(message)
 
 
 @dp.message(Command("tasks"))
 async def send_tasks(message: types.Message):
     async with db_pool.acquire() as conn:
         user_id = message.from_user.id
+        current_museum = await conn.fetchval("SELECT current_museum FROM users WHERE id=$1", user_id)
+
+        if current_museum is None:
+            await message.answer("Сначала выберите музей.")
+            return
+
         current_task_id = await conn.fetchval(
             "SELECT current_task_id FROM users WHERE id=$1",
             user_id
         )
 
         if not current_task_id:  # Если текущего задания нет
-            await conn.execute(
-                "UPDATE users SET current_task_id=1 WHERE id=$1",  # Устанавливаем первое задание
-                user_id
+            current_task_id = await conn.fetchval(
+                "SELECT MIN(id) FROM tasks WHERE museum_id=$1", current_museum
             )
-            current_task_id = 1
+
+            if not current_task_id:
+                await message.answer("Для выбранного музея пока нет заданий.")
+                return
+
+            await conn.execute(
+                "UPDATE users SET current_task_id=$1 WHERE id=$2",
+                current_task_id, user_id
+            )
 
         task = await conn.fetchrow(
-            "SELECT id, question FROM tasks WHERE id=$1",
-            current_task_id
+            "SELECT id, question FROM tasks WHERE id=$1 AND museum_id=$2",
+            current_task_id, current_museum
         )
 
         if not task:
@@ -110,32 +134,36 @@ async def send_tasks(message: types.Message):
         )
 
 
+
 @dp.message(lambda message: not message.text.startswith('/'))
 async def handle_answer(message: types.Message):
     user_id = message.from_user.id
     answer = message.text.strip().lower()
 
     async with db_pool.acquire() as conn:
-        # Получаем текущее задание
-        current_task_id = await conn.fetchval(
-            "SELECT current_task_id FROM users WHERE id=$1", user_id,
+        # Проверяем, выбрал ли пользователь музей
+        current_museum = await conn.fetchval(
+            "SELECT current_museum FROM users WHERE id=$1", user_id
         )
 
-        if not current_task_id:
-            await message.answer("Сначала получите задание командой /tasks.")
+        if current_museum is None:
+            await message.answer("Сначала выберите музей.")
             return
 
+        # Получаем текущее задание, но только для выбранного музея
         task = await conn.fetchrow(
-            "SELECT id, correct_answer FROM tasks WHERE id=$1", current_task_id
+            "SELECT id, correct_answer FROM tasks WHERE id = ("
+            "  SELECT current_task_id FROM users WHERE id=$1"
+            ") AND museum_id=$2",
+            user_id, current_museum
         )
 
         if not task:
-            await message.answer("Задание не найдено.")
+            await message.answer("Задание не найдено или оно не относится к выбранному музею.")
             return
 
         # Проверяем правильность ответа
         if answer == task["correct_answer"].lower():
-            # Ответ правильный, увеличиваем счет и переходим к следующему заданию
             await conn.execute(
                 "UPDATE users SET score = score + 1, current_task_id = current_task_id + 1 WHERE id=$1",
                 user_id
@@ -143,6 +171,7 @@ async def handle_answer(message: types.Message):
             await message.answer("Правильный ответ! Переходите к следующему вопросу командой /tasks.")
         else:
             await message.answer("Неправильный ответ. Попробуйте снова.")
+
 
 
 async def main():
