@@ -172,6 +172,20 @@ async def handle_answer(message: types.Message):
         else:
             await message.answer("Неправильный ответ. Попробуйте снова.")
 
+@dp.message(Command("leaderboard"))
+async def show_leaderboard(message: types.Message):
+    async with db_pool.acquire() as conn:
+        top_users = await conn.fetch("SELECT username, score FROM users ORDER BY score DESC LIMIT 10")
+
+        if not top_users:
+            await message.answer("Пока нет игроков в рейтинге.")
+            return
+
+        leaderboard_text = "🏆 Топ-10 игроков:\n"
+        for i, user in enumerate(top_users, start=1):
+            leaderboard_text += f"{i}. {user['username']}: {user['score']} очков\n"
+
+        await message.answer(leaderboard_text)
 
 
 async def main():
