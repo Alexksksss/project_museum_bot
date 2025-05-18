@@ -4,8 +4,22 @@ import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
+Иfrom aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import CallbackQuery
+from aiogram import F
+
 
 import json
+
+# допустим, task — это dict c полями из базы
+def get_quiz_keyboard(options: list[str], task_id: int) -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for opt in options:
+        keyboard.add(
+            InlineKeyboardButton(text=opt, callback_data=f"quiz:{task_id}:{opt}")
+        )
+    return keyboard
+
 
 def load_config():
     with open('config.json') as f:
@@ -26,6 +40,39 @@ db_pool = None
 async def create_db_pool():
     global db_pool
     db_pool = await asyncpg.create_pool(DB_URL)
+
+@dp.callback_query(F.data.startswith("answer:"))
+async def handle_quiz_answer(callback: CallbackQuery):
+    print(f"Callback data: {callback.data}")
+    user_id = callback.from_user.id
+    selected = callback.data.split(":")[1].strip().lower()
+
+    async with db_pool.acquire() as conn:
+        current_museum = await conn.fetchval(
+            "SELECT current_museum FROM users WHERE id=$1", user_id
+        )
+
+        task = await conn.fetchrow(
+            "SELECT id, correct_answer FROM tasks WHERE id=("
+            " SELECT current_task_id FROM users WHERE id=$1"
+            ") AND museum_id=$2",
+            user_id, current_museum
+        )
+
+        if not task:
+            await callback.message.answer("Ошибка: задание не найдено.")
+            return
+
+        if selected == task["correct_answer"].strip().lower():
+            await conn.execute(
+                "UPDATE users SET score = score + 1, current_task_id = current_task_id + 1 WHERE id=$1",
+                user_id
+            )
+
+            await callback.message.edit_reply_markup()  # убираем кнопки
+            await callback.message.answer("✅ Верно! /next — следующее задание")
+        else:
+            await callback.answer("❌ Неверно. Попробуй снова!", show_alert=True)
 
 
 @dp.message(Command("start"))
@@ -125,7 +172,7 @@ async def send_tasks(message: types.Message):
             )
 
         task = await conn.fetchrow(
-            "SELECT id, question FROM tasks WHERE id=$1 AND museum_id=$2",
+            "SELECT id, question, options FROM tasks WHERE id=$1 AND museum_id=$2",
             current_task_id, current_museum
         )
 
@@ -133,10 +180,45 @@ async def send_tasks(message: types.Message):
             await message.answer("Для выбранного музея пока нет заданий.")
             return
 
-        await message.answer(
-            f"Вопрос: {task['question']}\n"
-            "Отправьте ваш ответ."
-        )
+        # Получаем список опций, если они есть
+        options = task.get('options')
+        # print(options, 1)
+        if options:
+            try:
+                # Убираем лишние пробелы и гарантируем правильный формат
+                options = options.strip()
+
+                # Проверяем, является ли строка валидным JSON
+                if options.startswith('[') and options.endswith(']'):
+                    options = json.loads(options)
+                else:
+                    options = []
+
+            except json.JSONDecodeError:
+                options = []  # Если не удается распарсить JSON, делаем options пустым
+
+        # print(options)
+        if options:
+            # print(f"options перед созданием клавиатуры: {options}")
+
+            # Создаем inline-кнопки
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=opt, callback_data=f"answer:{opt}")]
+                    for opt in options
+                ]
+            )
+
+            await message.answer(
+                f"📌 Вопрос: {task['question']}",
+                reply_markup=keyboard
+            )
+        else:
+            # Старый способ: просто текст
+            await message.answer(
+                f"📌 Вопрос: {task['question']}\n"
+                "Отправьте ваш ответ."
+            )
 
 @dp.message(Command("next"))
 async def next_task(message: types.Message):
@@ -160,7 +242,7 @@ async def next_task(message: types.Message):
 
         # Находим следующее задание
         next_task = await conn.fetchrow(
-            "SELECT id, question FROM tasks WHERE id>=$1 AND museum_id=$2 ORDER BY id ASC LIMIT 1",
+            "SELECT id, question, options FROM tasks WHERE id>=$1 AND museum_id=$2 ORDER BY id ASC LIMIT 1",
             current_task_id, current_museum
         )
 
@@ -188,12 +270,45 @@ async def next_task(message: types.Message):
         )
         print(f"[next_task] Updated user {user_id} current_task_id to {next_task['id']}")
 
-        # Отправляем следующее задание
-        await message.answer(
-            f"📌 Следующее задание:\n{next_task['question']}\n"
-            "Отправьте ваш ответ."
-        )
+        # Получаем список опций, если они есть
+        options = next_task.get('options')
+        # print(options, 1)
+        if options:
+            try:
+                # Убираем лишние пробелы и гарантируем правильный формат
+                options = options.strip()
 
+                # Проверяем, является ли строка валидным JSON
+                if options.startswith('[') and options.endswith(']'):
+                    options = json.loads(options)
+                else:
+                    options = []
+
+            except json.JSONDecodeError:
+                options = []  # Если не удается распарсить JSON, делаем options пустым
+
+        # print(options)
+        if options:
+            # print(f"options перед созданием клавиатуры: {options}")
+
+            # Создаем inline-кнопки
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=opt, callback_data=f"answer:{opt}")]
+                    for opt in options
+                ]
+            )
+
+            await message.answer(
+                f"📌 Вопрос: {next_task['question']}",
+                reply_markup=keyboard
+            )
+        else:
+            # Старый способ: просто текст
+            await message.answer(
+                f"📌 Вопрос: {next_task['question']}\n"
+                "Отправьте ваш ответ."
+            )
 
 
 @dp.message(lambda message: not message.text.startswith('/'))
